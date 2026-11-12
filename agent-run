@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -u
+
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DB="$BASE/orchestration.db"
+MODE_FILE="$BASE/MODE.md"
+DATA_ROOT="$BASE"
+H_FAIL=0
+
+usage() {
+  cat >&2 <<'EOF'
+usage: agent-run <executor-name> <role> <ro|rw> <repo-dir> <brief-file> [out-file]
+       agent-run --health
+EOF
+  exit 2
+}
+
+die() {
+  echo "agent-run: $*" >&2
+  exit 2
+}
+
+preamble() {
+  printf 'Role: %s. You are a plain subordinate, not an orchestrator: do the work yourself, never delegate.' "$1"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Follows symlinks; prints the physical path. Returns non-zero on failure.
+resolve_real() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
+  else
+    python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"
+  fi
+}
+
+# Sets the global array CMD for the executor. Returns 1 if unknown kind.
+# $6 is an optional final-message file (codex only).
+build_cmd() {
+  local name="$1" mode="$2" repo="$3" prompt="$4" model="$5" final="${6:-}"
+  local agent sandbox mp
+  CMD=()
+  case "$name" in
+    opencode-*)
+      mp="$model"
+      case "$mp" in */*) mp="${mp##*/}" ;; esac
+      if [ -z "$mp" ]; then
+        die "executor $name has no model in the database"
+      fi
+      agent="plan"
+      [ "$mode" = "rw" ] && agent="build"
+      CMD=(opencode run --agent "$agent" -m "opencode/$mp" --dir "$repo" -- "$prompt")
+      ;;
+    cursor-agent)
+      # `cursor-agent --help` (checked 2026-10-29): --mode accepts only plan|ask;
+      # the write switch is -f/--force ("Force allow commands unless explicitly
+      # denied", --yolo is its alias). We use --force for rw, never --yolo.
+      if [ "$mode" = "rw" ]; then
+        CMD=(cursor-agent -p --model auto --trust --force "$prompt")
+      else
+        CMD=(cursor-agent -p --mode ask --model auto --trust "$prompt")
+      fi
+      ;;
+    copilot)
+      CMD=(copilot -s -p "$prompt" --allow-all-tools --allow-all-paths)
+      ;;
+    codex)
+      sandbox="read-only"
+      [ "$mode" = "rw" ] && sandbox="workspace-write"
+      CMD=(codex exec -s "$sandbox" --skip-git-repo-check --ephemeral)
+      if [ -n "$final" ]; then
+        CMD+=(-o "$final")
+      fi
+      CMD+=(-C "$repo" "$prompt")
+      ;;
+    koda)
+      if [ "$mode" = rw ]; then CMD=(koda --approval-mode auto_edit -p "$prompt"); else CMD=(koda -p "$prompt"); fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+health() {
+  [ -r "$MODE_FILE" ] || die "cannot read $MODE_FILE"
+  local first_line
+  first_line="$(head -n 1 "$MODE_FILE")"
+  H_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent-run-health.XXXXXX")" || die "mktemp failed"
+  trap 'rm -rf "${H_TMP:-}"' EXIT
+  local tmp="$H_TMP"
+
+  local rows name model
+  rows="$(sqlite3 -separator '|' "$DB" \
+    "select name, coalesce(model,'') from available_executors order by name;" 2>/dev/null)"
+  [ -n "$rows" ] || die "no executors found in available_executors"
+
+  local prompt
+  prompt="$(preamble verifier)"$'\n'"Reply with exactly the first line of MODE.md (file MODE.md in the current directory). Output only that line, nothing else."
+  local model_part
+
+  while IFS='|' read -r name model; do
+    [ -n "$name" ] || continue
+    case "$name" in claude-*) continue ;; esac
+    model_part="$model"
+    if ! build_cmd "$name" ro "$BASE" "$prompt" "$model_part" "$tmp/$name.final" 2>/dev/null; then
+      printf 'FAIL\t%s\t%s\n' "$name" "unknown executor kind" >"$tmp/$name.res"
+      continue
+    fi
+    (
+      start=$(date +%s)
+      ( cd "$BASE" && timeout 60 "${CMD[@]}" ) >"$tmp/$name.out" 2>&1
+      rc=$?
+      if [ "$name" = "codex" ]; then
+        if [ -s "$tmp/$name.final" ]; then
+          cp "$tmp/$name.final" "$tmp/$name.out"
+        else
+          : >"$tmp/$name.out"
+        fi
+      fi
+      end=$(date +%s)
+      secs=$((end - start))
+      if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        printf 'FAIL\t%s\ttimeout after 60s\n' "$name" >"$tmp/$name.res"
+        exit 0
+      fi
+      if [ ! -s "$tmp/$name.out" ]; then
+        printf 'FAIL\t%s\tempty output (exit %s)\n' "$name" "$rc" >"$tmp/$name.res"
+        exit 0
+      fi
+      if ! grep -Fq -- "$first_line" "$tmp/$name.out"; then
+        printf 'FAIL\t%s\tfirst line of MODE.md not found (exit %s)\n' "$name" "$rc" >"$tmp/$name.res"
+        exit 0
+      fi
+      printf 'OK\t%s\t%s\n' "$name" "$secs" >"$tmp/$name.res"
+    ) &
+  done <<<"$rows"
+  wait
+
+  local f lines="" line verdict who detail fail=0
+  for f in "$tmp"/*.res; do
+    [ -e "$f" ] || continue
+    IFS=$'\t' read -r verdict who detail <"$f"
+    line="$verdict $who $detail"
+    lines="$lines$line"$'\n'
+    [ "$verdict" = "OK" ] || fail=1
+  done
+  printf '%s' "$lines" | sort -k2
+  H_FAIL="$fail"
+
+  rm -rf "$H_TMP"
+  trap - EXIT
+}
+
+[ "${1:-}" = "--health" ] && { health; exit "$H_FAIL"; }
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && usage
+[ $# -ge 5 ] || usage
+
+NAME="$1"
+ROLE="$2"
+MODE="$3"
+REPO_IN="$4"
+BRIEF_IN="$5"
+OUT="${6:-}"
+
+case "$MODE" in ro|rw) ;; *) die "mode must be ro or rw, got '$MODE'" ;; esac
+
+# Validate the whole string, not line by line: a newline can never match.
+if [[ ! $NAME =~ ^[A-Za-z0-9._-]+$ ]]; then
+  die "invalid executor name '$NAME'"
+fi
+
+case "$NAME" in
+  ollama-*|qwen) die "executor $NAME is a local model and is banned by the user" ;;
+  claude-*) die "executor $NAME is a Claude model: provider separation forbids using it as a subagent" ;;
+esac
+
+# Defensive escaping; the regex above already forbids quotes.
+NAME_SQL="$(printf '%s' "$NAME" | sed "s/'/''/g")"
+
+row="$(sqlite3 -separator '|' "$DB" \
+  "select coalesce(model,''), coalesce(kind,''), disabled, status, can_write, approved_for_project_data
+     from available_executors where name='$NAME_SQL';" 2>/dev/null)"
+
+if [ -z "$row" ]; then
+  known="$(sqlite3 "$DB" "select disabled from executors where name='$NAME_SQL';" 2>/dev/null)"
+  if [ -n "$known" ]; then
+    die "executor $NAME is not available (disabled or blocked)"
+  fi
+  die "unknown executor $NAME"
+fi
+
+IFS='|' read -r MODEL KIND DISABLED STATUS CAN_WRITE APPROVED <<<"$row"
+
+[ "$STATUS" = "onboarded" ] || [ "$STATUS" = "candidate" ] || die "executor $NAME has status '$STATUS' (need onboarded or candidate)"
+[ "$DISABLED" = "0" ] || die "executor $NAME is disabled"
+[ "$KIND" = "cli" ] || die "executor $NAME has kind '$KIND', only cli is supported"
+
+if [ "$MODE" = "rw" ]; then
+  [ "$CAN_WRITE" = "1" ] || die "executor $NAME cannot write (can_write=0)"
+  [ "$APPROVED" = "1" ] || die "executor $NAME is not approved_for_project_data=1, refusing rw"
+fi
+
+[ -d "$REPO_IN" ] || die "repo dir '$REPO_IN' does not exist"
+REPO="$(cd "$REPO_IN" && pwd -P)" || die "cannot cd into '$REPO_IN'"
+[ -f "$BRIEF_IN" ] || die "brief file '$BRIEF_IN' does not exist"
+[ -r "$BRIEF_IN" ] || die "brief file '$BRIEF_IN' is not readable"
+BRIEF="$(resolve_real "$BRIEF_IN")" || die "cannot resolve brief file '$BRIEF_IN'"
+[ -n "$BRIEF" ] || die "cannot resolve brief file '$BRIEF_IN'"
+
+case "$BRIEF" in
+  "$REPO"/*|"$DATA_ROOT"/*) ;;
+  *)
+    if [ "$REPO" = "$DATA_ROOT" ]; then
+      die "brief file must be inside '$REPO' (agents cannot read /tmp)"
+    fi
+    die "brief file must be inside '$REPO' or '$DATA_ROOT' (agents cannot read /tmp)"
+    ;;
+esac
+
+build_cmd "$NAME" "$MODE" "$REPO" "" "$MODEL" || die "executor $NAME has an unsupported kind"
+
+PROMPT="$(preamble "$ROLE")"$'\n'"$(cat "$BRIEF")"
+
+FINAL_OUT=""
+if [ "$NAME" = "codex" ]; then
+  FINAL_OUT="$(mktemp "${TMPDIR:-/tmp}/agent-run-final.XXXXXX")" || die "mktemp failed"
+fi
+
+build_cmd "$NAME" "$MODE" "$REPO" "$PROMPT" "$MODEL" "$FINAL_OUT" || die "executor $NAME has an unsupported kind"
+
+STATUS_BEFORE=""
+STATUS_AFTER=""
+STATUS_BEFORE_FILE=""
+STATUS_AFTER_FILE=""
+if [ "$MODE" = "rw" ]; then
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    STATUS_BEFORE="$(git -C "$REPO" status --porcelain 2>/dev/null)"
+  else
+    STATUS_BEFORE="<not a git repository>"
+    echo "agent-run: warning: '$REPO' is not a git repository, status-diff is skipped" >&2
+  fi
+  if [ -n "$OUT" ]; then
+    STATUS_BEFORE_FILE="$OUT.status-before"
+    STATUS_AFTER_FILE="$OUT.status-after"
+  else
+    STATUS_PREFIX="$(mktemp "$BASE/runs/agent-run-status.XXXXXX")" || die "mktemp failed"
+    STATUS_BEFORE_FILE="$STATUS_PREFIX.status-before"
+    STATUS_AFTER_FILE="$STATUS_PREFIX.status-after"
+  fi
+  if ! printf '%s\n' "$STATUS_BEFORE" >"$STATUS_BEFORE_FILE"; then
+    echo "agent-run: warning: cannot write '$STATUS_BEFORE_FILE'" >&2
+  fi
+fi
+
+TIMEOUT="${AGENT_TIMEOUT:-280}"
+RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/agent-run-out.XXXXXX")" || die "mktemp failed"
+trap 'rm -f "${RUN_OUT:-}" "${FINAL_OUT:-}"' EXIT
+
+( cd "$REPO" && timeout "$TIMEOUT" "${CMD[@]}" ) >"$RUN_OUT" 2>&1
+RC=$?
+
+RESULT_FILE="$RUN_OUT"
+[ -n "$FINAL_OUT" ] && RESULT_FILE="$FINAL_OUT"
+
+if [ "$MODE" = "rw" ]; then
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    STATUS_AFTER="$(git -C "$REPO" status --porcelain 2>/dev/null)"
+  else
+    STATUS_AFTER="<not a git repository>"
+  fi
+  if ! printf '%s\n' "$STATUS_AFTER" >"$STATUS_AFTER_FILE"; then
+    echo "agent-run: warning: cannot write '$STATUS_AFTER_FILE'" >&2
+  fi
+  if [ -z "$OUT" ]; then
+    echo "--- git status before ---" >&2
+    printf '%s\n' "$STATUS_BEFORE" >&2
+    echo "--- git status after ---" >&2
+    printf '%s\n' "$STATUS_AFTER" >&2
+  fi
+  echo "--- status diff (before -> after) ---" >&2
+  diff <(printf '%s\n' "$STATUS_BEFORE") <(printf '%s\n' "$STATUS_AFTER") >&2 || true
+
+  EXCL_LINE="$(grep -m 1 '^Exclusive paths:' "$BRIEF" 2>/dev/null || true)"
+  if [ -n "$EXCL_LINE" ]; then
+    EXCL="${EXCL_LINE#Exclusive paths:}"
+    NEW_PATHS="$(comm -13 <(printf '%s\n' "$STATUS_BEFORE" | sort) <(printf '%s\n' "$STATUS_AFTER" | sort) 2>/dev/null || true)"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      path="${p:3}"
+      ok=0
+      IFS=',' read -r -a globs <<<"$EXCL"
+      for g in "${globs[@]}"; do
+        g="$(trim "$g")"
+        [ -n "$g" ] || continue
+        case "$path" in
+          $g) ok=1; break ;;
+        esac
+      done
+      [ "$ok" = 1 ] || echo "CHANGED OUTSIDE: $path"
+    done <<<"$NEW_PATHS"
+  fi
+fi
+
+if [ -n "$OUT" ]; then
+  if ! cat "$RESULT_FILE" >"$OUT"; then
+    echo "agent-run: warning: cannot write out-file '$OUT'" >&2
+  fi
+else
+  cat "$RESULT_FILE"
+fi
+
+if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+  echo "agent-run: $NAME timed out after ${TIMEOUT}s" >&2
+  exit 1
+fi
+
+if [ -n "$FINAL_OUT" ] && [ ! -s "$FINAL_OUT" ]; then
+  echo "agent-run: $NAME produced no final message (exit $RC)" >&2
+  exit 1
+fi
+
+if [ ! -s "$RESULT_FILE" ]; then
+  echo "agent-run: $NAME produced empty output (exit $RC)" >&2
+  exit 1
+fi
+
+if [ "$RC" -ne 0 ]; then
+  echo "agent-run: $NAME exited with code $RC" >&2
+  exit 3
+fi
+
+exit 0

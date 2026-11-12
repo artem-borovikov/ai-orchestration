@@ -1,0 +1,13 @@
+# runs, briefs, results and DB backups (prompts, project paths, task details):
+# the folders are kept through .gitkeep, their content is ignored
+runs/*
+!runs/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# orchestration state: executors, messages, runs, ratings
+orchestration.db
+orchestration.db-shm
+orchestration.db-wal
+
+.DS_Store
